@@ -1,0 +1,771 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import List, Dict, Tuple, Union, Optional
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ==============================================
+# КОНСТАНТЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==============================================
+
+EPSILON = 1e-8
+TARGET_COL = "RiskScore"
+ID_COL = "ID"
+
+
+def safe_log_transform(x: np.ndarray) -> np.ndarray:
+    """Безопасное логарифмическое преобразование с сохранением знака."""
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def robust_clip(values: np.ndarray, lower: float, upper: float) -> np.ndarray:
+    """Отсечение выбросов с проверкой границ."""
+    return np.clip(values, lower, upper)
+
+
+# ==============================================
+# КАСТОМНЫЕ МЕТРИКИ КАЧЕСТВА
+# ==============================================
+
+class ModelMetrics:
+    """Класс для вычисления метрик качества регрессии."""
+
+    @staticmethod
+    def compute_mse(actual: np.ndarray, predicted: np.ndarray) -> float:
+        """Среднеквадратичная ошибка."""
+        return np.mean((actual - predicted) ** 2)
+
+    @staticmethod
+    def compute_mae(actual: np.ndarray, predicted: np.ndarray) -> float:
+        """Средняя абсолютная ошибка."""
+        return np.mean(np.abs(actual - predicted))
+
+    @staticmethod
+    def compute_mape(actual: np.ndarray, predicted: np.ndarray) -> float:
+        """Средняя абсолютная процентная ошибка."""
+        denominator = np.abs(actual) + EPSILON
+        return np.mean(np.abs((actual - predicted) / denominator)) * 100
+
+    @staticmethod
+    def compute_r2(actual: np.ndarray, predicted: np.ndarray) -> float:
+        """Коэффициент детерминации R²."""
+        ss_residual = np.sum((actual - predicted) ** 2)
+        ss_total = np.sum((actual - np.mean(actual)) ** 2)
+        return 1 - ss_residual / (ss_total + EPSILON)
+
+    @staticmethod
+    def compute_all(actual: np.ndarray, predicted: np.ndarray) -> Dict[str, float]:
+        """Вычислить все метрики сразу."""
+        return {
+            'MSE': ModelMetrics.compute_mse(actual, predicted),
+            'MAE': ModelMetrics.compute_mae(actual, predicted),
+            'MAPE': ModelMetrics.compute_mape(actual, predicted),
+            'R2': ModelMetrics.compute_r2(actual, predicted)
+        }
+
+
+# ==============================================
+# КАСТОМНАЯ ЛИНЕЙНАЯ РЕГРЕССИЯ
+# ==============================================
+
+class CustomRegressor:
+    """Гибкая реализация линейной регрессии с разными методами обучения."""
+
+    def __init__(self,
+                 optimization: str = 'closed_form',
+                 regularization: Optional[str] = None,
+                 reg_strength: float = 0.01,
+                 learning_rate: float = 0.01,
+                 max_iterations: int = 1000,
+                 batch_size: int = 32,
+                 power: int = 2):
+
+        self.optimization = optimization
+        self.regularization = regularization
+        self.reg_strength = reg_strength
+        self.learning_rate = learning_rate
+        self.max_iterations = max_iterations
+        self.batch_size = batch_size
+        self.power = power
+
+        self.coefficients = None
+        self.intercept = 0.0
+        self.loss_history = []
+
+    def _add_intercept(self, X: np.ndarray) -> np.ndarray:
+        """Добавить столбец единиц для intercept."""
+        return np.hstack([np.ones((X.shape[0], 1)), X])
+
+    def _compute_gradients(self, X: np.ndarray, y: np.ndarray,
+                           predictions: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Вычислить градиенты для обновления параметров."""
+        n_samples = X.shape[0]
+        errors = predictions - y
+
+        # Градиенты по коэффициентам
+        d_coeff = (2 / n_samples) * X.T @ errors
+        d_intercept = (2 / n_samples) * np.sum(errors)
+
+        # Добавить регуляризацию
+        if self.regularization:
+            if self.regularization == 'l1':
+                d_coeff += self.reg_strength * np.sign(self.coefficients)
+            elif self.regularization == 'l2':
+                d_coeff += 2 * self.reg_strength * self.coefficients
+            elif self.regularization == 'lp':
+                sign = np.sign(self.coefficients)
+                magnitude = np.abs(self.coefficients) ** (self.power - 1)
+                d_coeff += self.reg_strength * self.power * sign * magnitude
+
+        return d_coeff, d_intercept
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> 'CustomRegressor':
+        """Обучение модели на данных."""
+        n_samples, n_features = X.shape
+        self.coefficients = np.zeros(n_features)
+
+        if self.optimization == 'closed_form':
+            # Аналитическое решение
+            X_extended = self._add_intercept(X)
+
+            if self.regularization == 'l2':
+                identity = np.eye(X_extended.shape[1])
+                identity[0, 0] = 0  # Не регуляризуем intercept
+                params = np.linalg.pinv(X_extended.T @ X_extended +
+                                        self.reg_strength * identity) @ X_extended.T @ y
+            else:
+                params = np.linalg.pinv(X_extended.T @ X_extended) @ X_extended.T @ y
+
+            self.intercept = params[0]
+            self.coefficients = params[1:]
+
+        elif self.optimization == 'gradient_descent':
+            # Градиентный спуск
+            for iteration in range(self.max_iterations):
+                predictions = X @ self.coefficients + self.intercept
+                d_coeff, d_intercept = self._compute_gradients(X, y, predictions)
+
+                self.coefficients -= self.learning_rate * d_coeff
+                self.intercept -= self.learning_rate * d_intercept
+
+                # Сохранить историю потерь
+                if iteration % 100 == 0:
+                    loss = np.mean((predictions - y) ** 2)
+                    self.loss_history.append(loss)
+
+        elif self.optimization == 'stochastic_gd':
+            # Стохастический градиентный спуск
+            for iteration in range(self.max_iterations):
+                indices = np.random.permutation(n_samples)
+                X_shuffled = X[indices]
+                y_shuffled = y[indices]
+
+                for i in range(0, n_samples, self.batch_size):
+                    batch_end = min(i + self.batch_size, n_samples)
+                    X_batch = X_shuffled[i:batch_end]
+                    y_batch = y_shuffled[i:batch_end]
+
+                    predictions = X_batch @ self.coefficients + self.intercept
+                    d_coeff, d_intercept = self._compute_gradients(X_batch, y_batch, predictions)
+
+                    self.coefficients -= self.learning_rate * d_coeff
+                    self.intercept -= self.learning_rate * d_intercept
+
+                if iteration % 100 == 0:
+                    predictions_full = X @ self.coefficients + self.intercept
+                    loss = np.mean((predictions_full - y) ** 2)
+                    self.loss_history.append(loss)
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Прогнозирование на новых данных."""
+        return X @ self.coefficients + self.intercept
+
+
+# ==============================================
+# ОБРАБОТКА И ИНЖЕНЕРИЯ ПРИЗНАКОВ
+# ==============================================
+
+class FeatureEngineer:
+    """Класс для создания и преобразования признаков."""
+
+    @staticmethod
+    def create_financial_features(data: pd.DataFrame) -> pd.DataFrame:
+        """Создание финансовых признаков."""
+        df = data.copy()
+
+        # Процентные ставки
+        df['InterestSpread'] = df['InterestRate'] - df['BaseInterestRate']
+        df['AvgInterestRate'] = (df['InterestRate'] + df['BaseInterestRate']) / 2
+
+        # Доходы и расходы
+        df['LoanToIncomeRatio'] = df['LoanAmount'] / (df['AnnualIncome'] + EPSILON)
+        df['MonthlyExpenses'] = df['MonthlyLoanPayment'] + df['MonthlyDebtPayments']
+        df['DebtServiceRatio'] = df['MonthlyExpenses'] / (df['MonthlyIncome'] + EPSILON)
+        df['DisposableIncome'] = df['MonthlyIncome'] - df['MonthlyExpenses']
+
+        # Активы и обязательства
+        df['AssetLiabilityRatio'] = df['TotalAssets'] / (df['TotalLiabilities'] + EPSILON)
+        df['NetWorthRatio'] = df['NetWorth'] / (df['AnnualIncome'] + EPSILON)
+
+        # Кредитные характеристики
+        df['CreditUtilizationPerAccount'] = (
+                df['CreditCardUtilizationRate'] /
+                (df['NumberOfOpenCreditLines'] + 1)
+        )
+
+        # Демографические признаки
+        df['IncomePerDependent'] = df['AnnualIncome'] / (df['NumberOfDependents'] + 1)
+        df['CareerToAgeRatio'] = df['Experience'] / (df['Age'] + EPSILON)
+
+        # Логарифмические преобразования
+        monetary_features = ['AnnualIncome', 'LoanAmount', 'TotalAssets', 'NetWorth']
+        for feature in monetary_features:
+            if feature in df.columns:
+                df[f'Log_{feature}'] = safe_log_transform(df[feature].values)
+
+        return df
+
+    @staticmethod
+    def process_categorical_features(data: pd.DataFrame) -> pd.DataFrame:
+        """Обработка категориальных признаков."""
+        df = data.copy()
+
+        # Преобразование уровня образования
+        education_map = {
+            'High School': 1,
+            'Associate': 2,
+            'Bachelor': 3,
+            'Master': 4,
+            'Doctorate': 5
+        }
+
+        if 'EducationLevel' in df.columns:
+            df['EducationLevel'] = df['EducationLevel'].map(education_map).fillna(0)
+
+        # Биннинг числовых признаков
+        if 'CreditScore' in df.columns:
+            bins = [300, 580, 670, 740, 800, 850]
+            labels = ['VeryPoor', 'Fair', 'Good', 'VeryGood', 'Excellent']
+            df['CreditScoreCategory'] = pd.cut(
+                df['CreditScore'], bins=bins, labels=labels, include_lowest=True
+            ).astype(str)
+
+        return df
+
+    @staticmethod
+    def extract_date_features(data: pd.DataFrame, date_col: str) -> pd.DataFrame:
+        """Извлечение признаков из даты."""
+        df = data.copy()
+
+        if date_col in df.columns:
+            dates = pd.to_datetime(df[date_col], errors='coerce')
+            df[f'{date_col}_Year'] = dates.dt.year
+            df[f'{date_col}_Month'] = dates.dt.month
+            df[f'{date_col}_Quarter'] = dates.dt.quarter
+            df[f'{date_col}_DayOfWeek'] = dates.dt.dayofweek
+            df[f'{date_col}_DayOfYear'] = dates.dt.dayofyear
+
+            # Удалить исходную колонку даты
+            df.drop(columns=[date_col], inplace=True)
+
+        return df
+
+
+# ==============================================
+# ПРЕПРОЦЕССИНГ И ПАЙПЛАЙН
+# ==============================================
+
+class RegressionPipeline:
+    """Полный пайплайн для предобработки и регрессии."""
+
+    def __init__(self,
+                 model_type: str = 'closed_form',
+                 scaling: str = 'standard',
+                 use_polynomial: bool = True,
+                 polynomial_degree: int = 2,
+                 feature_selection_percent: float = 30.0,
+                 regularization: Optional[str] = None,
+                 reg_param: float = 0.01):
+
+        self.model_type = model_type
+        self.scaling = scaling
+        self.use_polynomial = use_polynomial
+        self.polynomial_degree = polynomial_degree
+        self.feature_selection_percent = feature_selection_percent
+
+        # Статистики для трансформации
+        self.numeric_means = None
+        self.numeric_stds = None
+        self.numeric_mins = None
+        self.numeric_maxs = None
+        self.categorical_modes = None
+        self.poly_means = None
+        self.poly_stds = None
+        self.selected_features = None
+
+        # Модели
+        self.polynomial_transformer = None
+        self.encoder = None
+        self.regressor = None
+
+        self.regularization = regularization
+        self.reg_param = reg_param
+
+    def _scale_features(self,
+                        data: pd.DataFrame,
+                        numeric_cols: List[str],
+                        is_training: bool = True) -> pd.DataFrame:
+        """Масштабирование числовых признаков."""
+        df = data.copy()
+
+        if self.scaling == 'standard':
+            if is_training:
+                self.numeric_means = df[numeric_cols].mean()
+                self.numeric_stds = df[numeric_cols].std().replace(0, 1)
+
+            df[numeric_cols] = (df[numeric_cols] - self.numeric_means) / self.numeric_stds
+
+        elif self.scaling == 'minmax':
+            if is_training:
+                self.numeric_mins = df[numeric_cols].min()
+                self.numeric_maxs = df[numeric_cols].max()
+
+            denominator = self.numeric_maxs - self.numeric_mins + EPSILON
+            df[numeric_cols] = (df[numeric_cols] - self.numeric_mins) / denominator
+
+        return df
+
+    def _select_features_by_correlation(self,
+                                        features: pd.DataFrame,
+                                        target: pd.Series,
+                                        is_training: bool = True) -> pd.DataFrame:
+        """Отбор признаков на основе корреляции с целевой переменной."""
+        
+        if is_training:
+            if target is None:
+                raise ValueError("Target must be provided for training")
+                
+            # Вычислить корреляции
+            correlations = features.apply(lambda col: col.corr(target))
+            absolute_correlations = correlations.abs()
+
+            # Выбрать топ N процентов признаков
+            n_features = len(features.columns)
+            n_to_select = max(1, int(self.feature_selection_percent / 100 * n_features))
+
+            # Отсортировать по абсолютной корреляции
+            sorted_indices = absolute_correlations.sort_values(ascending=False).index
+            self.selected_features = sorted_indices[:n_to_select].tolist()
+            
+            print(f"Selected {len(self.selected_features)} features out of {n_features}")
+
+        # Вернуть выбранные признаки
+        if self.selected_features is None:
+            raise ValueError("Features must be selected during training first")
+            
+        return features[self.selected_features]
+
+    def fit(self,
+            X: pd.DataFrame,
+            y: pd.Series,
+            numeric_cols: List[str],
+            categorical_cols: List[str]) -> 'RegressionPipeline':
+        """Обучение пайплайна."""
+
+        # Шаг 1: Обработка пропущенных значений
+        self.numeric_means = X[numeric_cols].median()
+        X[numeric_cols] = X[numeric_cols].fillna(self.numeric_means)
+
+        if categorical_cols:
+            self.categorical_modes = X[categorical_cols].mode().iloc[0]
+            X[categorical_cols] = X[categorical_cols].fillna(self.categorical_modes)
+
+        # Шаг 2: Масштабирование числовых признаков
+        X_scaled = self._scale_features(X, numeric_cols, is_training=True)
+
+        # Шаг 3: Полиномиальные признаки (только для небольшого количества признаков)
+        if self.use_polynomial and len(numeric_cols) <= 20:  # Ограничение
+            from sklearn.preprocessing import PolynomialFeatures
+            self.polynomial_transformer = PolynomialFeatures(
+                degree=min(self.polynomial_degree, 2),  # Ограничиваем степень
+                include_bias=False
+            )
+            poly_features = self.polynomial_transformer.fit_transform(X_scaled[numeric_cols])
+            poly_columns = self.polynomial_transformer.get_feature_names_out(numeric_cols)
+            poly_df = pd.DataFrame(poly_features, columns=poly_columns, index=X.index)
+
+            # Масштабирование полиномиальных признаков
+            self.poly_means = poly_df.mean()
+            self.poly_stds = poly_df.std().replace(0, 1)
+            poly_df = (poly_df - self.poly_means) / self.poly_stds
+
+            X_processed = pd.concat([poly_df, X_scaled[categorical_cols]], axis=1)
+        else:
+            X_processed = X_scaled
+            print(f"Skipping polynomial features due to {len(numeric_cols)} numeric columns")
+
+        # Шаг 4: One-Hot Encoding для категориальных признаков
+        if categorical_cols:
+            from sklearn.preprocessing import OneHotEncoder
+            self.encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+            encoded_features = self.encoder.fit_transform(X_processed[categorical_cols])
+            encoded_columns = self.encoder.get_feature_names_out(categorical_cols)
+            encoded_df = pd.DataFrame(encoded_features, columns=encoded_columns, index=X.index)
+
+            X_final = pd.concat([X_processed.drop(columns=categorical_cols), encoded_df], axis=1)
+        else:
+            X_final = X_processed
+
+        # Шаг 5: Отбор признаков
+        X_selected_df = self._select_features_by_correlation(X_final, y, is_training=True)
+        X_selected = X_selected_df.values
+
+        # Шаг 6: Обучение модели
+        if self.model_type == 'sklearn':
+            from sklearn.linear_model import LinearRegression
+            self.regressor = LinearRegression()
+        else:
+            self.regressor = CustomRegressor(
+                optimization=self.model_type,
+                regularization=self.regularization,
+                reg_strength=self.reg_param,
+                learning_rate=0.01,
+                max_iterations=1000,
+                batch_size=32
+            )
+
+        print(f"Training model on {X_selected.shape[1]} features...")
+        self.regressor.fit(X_selected, y.values)
+
+        return self
+
+    def predict(self,
+                X: pd.DataFrame,
+                numeric_cols: List[str],
+                categorical_cols: List[str]) -> np.ndarray:
+        """Прогнозирование на новых данных."""
+
+        # Применить те же трансформации
+        X[numeric_cols] = X[numeric_cols].fillna(self.numeric_means)
+        if categorical_cols:
+            X[categorical_cols] = X[categorical_cols].fillna(self.categorical_modes)
+
+        X_scaled = self._scale_features(X, numeric_cols, is_training=False)
+
+        if self.use_polynomial and self.polynomial_transformer is not None:
+            poly_features = self.polynomial_transformer.transform(X_scaled[numeric_cols])
+            poly_columns = self.polynomial_transformer.get_feature_names_out(numeric_cols)
+            poly_df = pd.DataFrame(poly_features, columns=poly_columns, index=X.index)
+
+            # Масштабирование с сохраненными параметрами
+            poly_df = (poly_df - self.poly_means) / self.poly_stds
+
+            X_processed = pd.concat([poly_df, X_scaled[categorical_cols]], axis=1)
+        else:
+            X_processed = X_scaled
+
+        if categorical_cols and self.encoder is not None:
+            encoded_features = self.encoder.transform(X_processed[categorical_cols])
+            encoded_columns = self.encoder.get_feature_names_out(categorical_cols)
+            encoded_df = pd.DataFrame(encoded_features, columns=encoded_columns, index=X.index)
+
+            X_final = pd.concat([X_processed.drop(columns=categorical_cols), encoded_df], axis=1)
+        else:
+            X_final = X_processed
+
+        X_selected_df = self._select_features_by_correlation(X_final, None, is_training=False)
+        X_selected = X_selected_df.values
+
+        predictions = self.regressor.predict(X_selected)
+        return robust_clip(predictions, 0.0, 100.0)
+
+
+# ==============================================
+# КРОСС-ВАЛИДАЦИЯ
+# ==============================================
+
+class CrossValidation:
+    """Реализация кросс-валидации."""
+
+    def __init__(self,
+                 n_splits: int = 5,
+                 shuffle: bool = True,
+                 random_seed: int = 42):
+        self.n_splits = n_splits
+        self.shuffle = shuffle
+        self.random_seed = random_seed
+
+    def split(self, X: pd.DataFrame):
+        """Генератор разбиений для кросс-валидации."""
+        n_samples = len(X)
+        indices = np.arange(n_samples)
+
+        if self.shuffle:
+            np.random.seed(self.random_seed)
+            np.random.shuffle(indices)
+
+        fold_sizes = np.full(self.n_splits, n_samples // self.n_splits, dtype=int)
+        fold_sizes[:n_samples % self.n_splits] += 1
+
+        current = 0
+        for fold_size in fold_sizes:
+            start, end = current, current + fold_size
+            test_indices = indices[start:end]
+            train_indices = np.concatenate([indices[:start], indices[end:]])
+
+            yield train_indices, test_indices
+            current = end
+
+
+# ==============================================
+# ВИЗУАЛИЗАЦИЯ И АНАЛИЗ
+# ==============================================
+
+class DataAnalyzer:
+    """Класс для анализа данных и визуализации."""
+
+    @staticmethod
+    def plot_target_distribution(data: pd.DataFrame, target_col: str):
+        """Распределение целевой переменной."""
+        plt.figure(figsize=(10, 6))
+
+        plt.subplot(1, 2, 1)
+        sns.histplot(data[target_col], kde=True, color='blue')
+        plt.title(f'Distribution of {target_col}')
+
+        plt.subplot(1, 2, 2)
+        sns.boxplot(x=data[target_col], color='lightblue')
+        plt.title(f'Boxplot of {target_col}')
+
+        plt.tight_layout()
+        plt.show()
+
+    @staticmethod
+    def plot_correlation_matrix(data: pd.DataFrame, target_col: str):
+        """Матрица корреляций."""
+        numeric_data = data.select_dtypes(include=[np.number])
+
+        if target_col in numeric_data.columns:
+            correlations = numeric_data.corr()[target_col].sort_values(ascending=False)
+
+            print("Top positive correlations:")
+            print(correlations.head(10))
+            print("\nTop negative correlations:")
+            print(correlations.tail(10))
+
+            # Визуализация
+            plt.figure(figsize=(12, 8))
+            top_features = list(correlations.index[1:11]) + list(correlations.index[-10:])
+            top_corr = numeric_data[top_features + [target_col]].corr()
+
+            sns.heatmap(top_corr, annot=True, cmap='coolwarm', center=0,
+                        square=True, linewidths=0.5)
+            plt.title('Correlation Matrix (Top Features)')
+            plt.show()
+
+
+# ==============================================
+# ОСНОВНАЯ ПРОГРАММА
+# ==============================================
+
+def main():
+    """Основная функция программы."""
+
+    # Конфигурация
+    TRAIN_PATH = "D:/Laba ML/LabaLaba1/train.csv"
+    TEST_PATH = "D:/Laba ML/LabaLaba1/test.csv"
+    OUTPUT_PATH = "D:/Laba ML/LabaLaba1/submission.csv"
+
+    # Загрузка данных
+    print("Loading data...")
+    train_data = pd.read_csv(TRAIN_PATH)
+    test_data = pd.read_csv(TEST_PATH)
+
+    # Предобработка целевой переменной
+    print("Preprocessing target variable...")
+    train_data = train_data.dropna(subset=[TARGET_COL])
+    train_data = train_data[train_data[TARGET_COL].abs() <= 200]
+    train_data[TARGET_COL] = robust_clip(train_data[TARGET_COL].values, 0.0, 100.0)
+
+    # Инжиниринг признаков
+    print("Engineering features...")
+    feature_engineer = FeatureEngineer()
+
+    # Применение преобразований к train и test
+    train_data = feature_engineer.create_financial_features(train_data)
+    train_data = feature_engineer.process_categorical_features(train_data)
+    train_data = feature_engineer.extract_date_features(train_data, 'ApplicationDate')
+    
+    test_data = feature_engineer.create_financial_features(test_data)
+    test_data = feature_engineer.process_categorical_features(test_data)
+    test_data = feature_engineer.extract_date_features(test_data, 'ApplicationDate')
+
+    # Разделение на признаки и целевую переменную
+    X = train_data.drop(columns=[TARGET_COL])
+    if ID_COL in train_data.columns:
+        X = X.drop(columns=[ID_COL])
+    y = train_data[TARGET_COL]
+
+    if ID_COL in test_data.columns:
+        X_test = test_data.drop(columns=[ID_COL])
+        test_ids = test_data[ID_COL]
+    else:
+        # Если нет колонки ID, создаем ее
+        X_test = test_data.copy()
+        test_ids = pd.Series(range(len(test_data)), name=ID_COL)
+
+    # Определение типов признаков
+    numeric_columns = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_columns = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    print(f"Numeric features: {len(numeric_columns)}")
+    print(f"Categorical features: {len(categorical_columns)}")
+
+    # Анализ данных
+    analyzer = DataAnalyzer()
+    analyzer.plot_target_distribution(train_data, TARGET_COL)
+    analyzer.plot_correlation_matrix(train_data, TARGET_COL)
+
+    # Настройки моделей для тестирования
+    model_configs = [
+        # (model_type, regularization, reg_param, description)
+        ('gradient_descent', 'l2', 0.001, 'GD with L2'),
+        ('gradient_descent', 'l1', 0.1, 'GD with L1'),
+        ('stochastic_gd', None, 0, 'Stochastic GD'),
+    ]
+
+    # Кросс-валидация
+    print("\n" + "=" * 50)
+    print("CROSS-VALIDATION RESULTS")
+    print("=" * 50)
+
+    cv = CrossValidation(n_splits=3, shuffle=True, random_seed=42)  # Уменьшили до 3
+    results = {}
+
+    for model_type, reg, reg_param, description in model_configs:
+        mse_scores = []
+        
+        print(f"\nTesting: {description}")
+
+        for fold, (train_idx, val_idx) in enumerate(cv.split(X)):
+            print(f"  Fold {fold + 1}/{3}", end=" ")
+            X_train_fold = X.iloc[train_idx].copy()
+            X_val_fold = X.iloc[val_idx].copy()
+            y_train_fold = y.iloc[train_idx]
+            y_val_fold = y.iloc[val_idx]
+
+            # Создание и обучение пайплайна
+            pipeline = RegressionPipeline(
+                model_type=model_type,
+                scaling='standard',
+                use_polynomial=False,  # Отключаем полиномы для скорости
+                polynomial_degree=2,
+                feature_selection_percent=50.0,  # Увеличили процент отбора
+                regularization=reg,
+                reg_param=reg_param
+            )
+
+            pipeline.fit(X_train_fold, y_train_fold,
+                         numeric_columns, categorical_columns)
+
+            # Предсказание и оценка
+            predictions = pipeline.predict(X_val_fold,
+                                           numeric_columns, categorical_columns)
+
+            mse = ModelMetrics.compute_mse(y_val_fold.values, predictions)
+            mse_scores.append(mse)
+            print(f"- MSE: {mse:.4f}")
+
+        mean_mse = np.mean(mse_scores)
+        std_mse = np.std(mse_scores)
+        results[description] = mean_mse
+
+        print(f"{description:25} | Mean MSE: {mean_mse:.4f} ± {std_mse:.4f}")
+
+    # Выбор лучшей модели
+    best_description = min(results, key=results.get)
+    print(f"\nBest model: {best_description} (MSE: {results[best_description]:.4f})")
+
+    # Полное обучение лучшей модели на всех данных
+    print("\nTraining final model on all data...")
+
+    # Находим конфигурацию лучшей модели
+    best_config = None
+    for config in model_configs:
+        if config[3] == best_description:
+            best_config = config
+            break
+
+    if best_config:
+        final_pipeline = RegressionPipeline(
+            model_type=best_config[0],
+            scaling='standard',
+            use_polynomial=False,  # Оставляем отключенными для скорости
+            polynomial_degree=2,
+            feature_selection_percent=50.0,
+            regularization=best_config[1],
+            reg_param=best_config[2]
+        )
+
+        final_pipeline.fit(X, y, numeric_columns, categorical_columns)
+
+        # Тестирование на валидационной выборке
+        from sklearn.model_selection import train_test_split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+
+        val_pipeline = RegressionPipeline(
+            model_type=best_config[0],
+            scaling='standard',
+            use_polynomial=False,
+            polynomial_degree=2,
+            feature_selection_percent=50.0,
+            regularization=best_config[1],
+            reg_param=best_config[2]
+        )
+
+        val_pipeline.fit(X_train, y_train, numeric_columns, categorical_columns)
+        val_predictions = val_pipeline.predict(X_val, numeric_columns, categorical_columns)
+
+        # Вывод метрик
+        print("\n" + "=" * 50)
+        print("VALIDATION METRICS")
+        print("=" * 50)
+
+        metrics = ModelMetrics.compute_all(y_val.values, val_predictions)
+        for metric_name, value in metrics.items():
+            print(f"{metric_name:10}: {value:.4f}")
+
+    # Предсказание на тестовых данных
+    print("\nMaking predictions on test data...")
+    final_predictions = final_pipeline.predict(X_test, numeric_columns, categorical_columns)
+
+    # Сохранение результатов
+    submission = pd.DataFrame({
+        ID_COL: test_ids,
+        TARGET_COL: final_predictions
+    })
+
+    submission.to_csv(OUTPUT_PATH, index=False)
+    print(f"\nPredictions saved to: {OUTPUT_PATH}")
+    print(f"Number of predictions: {len(final_predictions)}")
+
+    # Дополнительная визуализация
+    print("\nGenerating visualization of predictions...")
+    plt.figure(figsize=(10, 6))
+    plt.hist(final_predictions, bins=30, alpha=0.7, color='green', edgecolor='black')
+    plt.xlabel('Predicted Risk Score')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Predictions')
+    plt.grid(alpha=0.3)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
